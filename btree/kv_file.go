@@ -10,9 +10,11 @@ type KV struct {
 	Path string
 	file *os.File
 	tree BTree
+	free FreeList
 	page struct {
 		flushed uint64
-		temp    [][]byte
+		nappend uint64
+		updates map[uint64][]byte
 	}
 	cache  map[uint64][]byte
 	failed bool
@@ -28,13 +30,18 @@ func (db *KV) Open() error {
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
 	}
+	db.page.updates = make(map[uint64][]byte)
+	db.cache = make(map[uint64][]byte)
 	if err := readRoot(db, fi.Size()); err != nil {
 		return err
 	}
-	db.cache = make(map[uint64][]byte)
 	db.tree.get = db.pageRead
-	db.tree.new = db.pageAppend
-	db.tree.del = func(uint64) {}
+	db.tree.new = db.pageAlloc
+	db.tree.del = db.free.PushTail
+	db.free.get = db.pageRead
+	db.free.new = db.pageAppend
+	db.free.set = db.pageWrite
+	db.free.maxSeq = db.free.tailSeq
 	return nil
 }
 
@@ -72,9 +79,16 @@ func (db *KV) Del(key []byte) (bool, error) {
 }
 
 func (db *KV) pageRead(ptr uint64) []byte {
+	if node, ok := db.page.updates[ptr]; ok {
+		return node
+	}
 	if p, ok := db.cache[ptr]; ok {
 		return p
 	}
+	return db.pageReadFile(ptr)
+}
+
+func (db *KV) pageReadFile(ptr uint64) []byte {
 	buf := make([]byte, BTREE_PAGE_SIZE)
 	off := int64(ptr) * int64(BTREE_PAGE_SIZE)
 	n, err := db.file.ReadAt(buf, off)
@@ -86,15 +100,39 @@ func (db *KV) pageRead(ptr uint64) []byte {
 }
 
 func (db *KV) pageAppend(node []byte) uint64 {
-	ptr := db.page.flushed + uint64(len(db.page.temp))
-	db.page.temp = append(db.page.temp, node[:BTREE_PAGE_SIZE])
+	ptr := db.page.flushed + db.page.nappend
+	copyBuf := make([]byte, BTREE_PAGE_SIZE)
+	copy(copyBuf, node[:BTREE_PAGE_SIZE])
+	db.page.updates[ptr] = copyBuf
+	db.page.nappend++
 	return ptr
 }
 
+func (db *KV) pageAlloc(node []byte) uint64 {
+	if ptr := db.free.PopHead(); ptr != 0 {
+		copyBuf := make([]byte, BTREE_PAGE_SIZE)
+		copy(copyBuf, node[:BTREE_PAGE_SIZE])
+		db.page.updates[ptr] = copyBuf
+		return ptr
+	}
+	return db.pageAppend(node)
+}
+
+func (db *KV) pageWrite(ptr uint64) []byte {
+	if node, ok := db.page.updates[ptr]; ok {
+		return node
+	}
+	node := make([]byte, BTREE_PAGE_SIZE)
+	copy(node, db.pageReadFile(ptr))
+	db.page.updates[ptr] = node
+	return node
+}
+
 func writePages(db *KV) error {
-	base := int64(db.page.flushed) * int64(BTREE_PAGE_SIZE)
-	for i, pg := range db.page.temp {
-		off := base + int64(i)*int64(BTREE_PAGE_SIZE)
+	for i := uint64(0); i < db.page.nappend; i++ {
+		ptr := db.page.flushed + i
+		pg := db.page.updates[ptr]
+		off := int64(ptr) * int64(BTREE_PAGE_SIZE)
 		n, err := db.file.WriteAt(pg, off)
 		if err != nil {
 			return err
@@ -102,20 +140,38 @@ func writePages(db *KV) error {
 		if n != BTREE_PAGE_SIZE {
 			return fmt.Errorf("short write")
 		}
-		db.cache[db.page.flushed+uint64(i)] = append([]byte(nil), pg...)
+		db.cache[ptr] = append([]byte(nil), pg...)
 	}
-	db.page.flushed += uint64(len(db.page.temp))
-	db.page.temp = db.page.temp[:0]
+	for ptr, pg := range db.page.updates {
+		if ptr < db.page.flushed {
+			off := int64(ptr) * int64(BTREE_PAGE_SIZE)
+			n, err := db.file.WriteAt(pg, off)
+			if err != nil {
+				return err
+			}
+			if n != BTREE_PAGE_SIZE {
+				return fmt.Errorf("short write")
+			}
+			db.cache[ptr] = append([]byte(nil), pg...)
+		}
+	}
+	db.page.flushed += db.page.nappend
+	db.page.nappend = 0
+	db.page.updates = make(map[uint64][]byte)
 	return nil
 }
 
-const DB_SIG = "BuildYourOwnDB06"
+const DB_SIG = "BuildYourOwnDB07"
 
 func saveMeta(db *KV) []byte {
-	var data [32]byte
+	var data [64]byte
 	copy(data[:16], []byte(DB_SIG))
 	binary.LittleEndian.PutUint64(data[16:], db.tree.root)
 	binary.LittleEndian.PutUint64(data[24:], db.page.flushed)
+	binary.LittleEndian.PutUint64(data[32:], db.free.headPage)
+	binary.LittleEndian.PutUint64(data[40:], db.free.headSeq)
+	binary.LittleEndian.PutUint64(data[48:], db.free.tailPage)
+	binary.LittleEndian.PutUint64(data[56:], db.free.tailSeq)
 	return data[:]
 }
 
@@ -125,16 +181,22 @@ func loadMeta(db *KV, data []byte) {
 	}
 	db.tree.root = binary.LittleEndian.Uint64(data[16:])
 	db.page.flushed = binary.LittleEndian.Uint64(data[24:])
+	db.free.headPage = binary.LittleEndian.Uint64(data[32:])
+	db.free.headSeq = binary.LittleEndian.Uint64(data[40:])
+	db.free.tailPage = binary.LittleEndian.Uint64(data[48:])
+	db.free.tailSeq = binary.LittleEndian.Uint64(data[56:])
 }
 
 func readRoot(db *KV, fileSize int64) error {
 	if fileSize == 0 {
-		db.page.flushed = 1
+		db.page.flushed = 2
+		db.free.headPage = 1
+		db.free.tailPage = 1
 		return nil
 	}
-	buf := make([]byte, 32)
+	buf := make([]byte, 64)
 	n, err := db.file.ReadAt(buf, 0)
-	if err != nil || n != 32 {
+	if err != nil || n != 64 {
 		return fmt.Errorf("read meta")
 	}
 	loadMeta(db, buf)
@@ -163,7 +225,11 @@ func updateFile(db *KV) error {
 	if err := updateRoot(db); err != nil {
 		return err
 	}
-	return db.file.Sync()
+	if err := db.file.Sync(); err != nil {
+		return err
+	}
+	db.free.SetMaxSeq()
+	return nil
 }
 
 func updateOrRevert(db *KV, meta []byte) error {
@@ -179,7 +245,8 @@ func updateOrRevert(db *KV, meta []byte) error {
 	err := updateFile(db)
 	if err != nil {
 		loadMeta(db, meta)
-		db.page.temp = db.page.temp[:0]
+		db.page.updates = make(map[uint64][]byte)
+		db.page.nappend = 0
 		db.failed = true
 	}
 	return err
