@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"go-db/internal/btree"
+	"go-db/btree"
 )
 
 func main() {
