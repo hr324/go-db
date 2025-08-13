@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"sync"
 )
 
 type KV struct {
@@ -15,8 +16,10 @@ type KV struct {
 		flushed uint64
 		nappend uint64
 		updates map[uint64][]byte
+		umu     sync.RWMutex
 	}
 	cache  map[uint64][]byte
+	cmu    sync.RWMutex
 	failed bool
 }
 
@@ -30,8 +33,12 @@ func (db *KV) Open() error {
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
 	}
+	db.page.umu.Lock()
 	db.page.updates = make(map[uint64][]byte)
+	db.page.umu.Unlock()
+	db.cmu.Lock()
 	db.cache = make(map[uint64][]byte)
+	db.cmu.Unlock()
 	if err := readRoot(db, fi.Size()); err != nil {
 		return err
 	}
@@ -42,6 +49,7 @@ func (db *KV) Open() error {
 	db.free.new = db.pageAppend
 	db.free.set = db.pageWrite
 	db.free.maxSeq = db.free.tailSeq
+	db.RegisterFreeSeqProvider(func(_ *KV) uint64 { return db.free.tailSeq })
 	return nil
 }
 
@@ -79,12 +87,18 @@ func (db *KV) Del(key []byte) (bool, error) {
 }
 
 func (db *KV) pageRead(ptr uint64) []byte {
+	db.page.umu.RLock()
 	if node, ok := db.page.updates[ptr]; ok {
+		db.page.umu.RUnlock()
 		return node
 	}
+	db.page.umu.RUnlock()
+	db.cmu.RLock()
 	if p, ok := db.cache[ptr]; ok {
+		db.cmu.RUnlock()
 		return p
 	}
+	db.cmu.RUnlock()
 	return db.pageReadFile(ptr)
 }
 
@@ -95,43 +109,67 @@ func (db *KV) pageReadFile(ptr uint64) []byte {
 	if err != nil || n != BTREE_PAGE_SIZE {
 		panic("bad read")
 	}
+	db.cmu.Lock()
 	db.cache[ptr] = buf
+	db.cmu.Unlock()
 	return buf
 }
 
 func (db *KV) pageAppend(node []byte) uint64 {
-	ptr := db.page.flushed + db.page.nappend
 	copyBuf := make([]byte, BTREE_PAGE_SIZE)
 	copy(copyBuf, node[:BTREE_PAGE_SIZE])
+	db.page.umu.Lock()
+	ptr := db.page.flushed + db.page.nappend
 	db.page.updates[ptr] = copyBuf
 	db.page.nappend++
+	db.page.umu.Unlock()
 	return ptr
 }
 
 func (db *KV) pageAlloc(node []byte) uint64 {
-	if ptr := db.free.PopHead(); ptr != 0 {
+	allowed := db.OldestActiveReaderSeq()
+	if db.free.maxSeq < allowed {
+		allowed = db.free.maxSeq
+	}
+	if ptr := db.free.PopHeadLe(allowed); ptr != 0 {
 		copyBuf := make([]byte, BTREE_PAGE_SIZE)
 		copy(copyBuf, node[:BTREE_PAGE_SIZE])
+		db.page.umu.Lock()
 		db.page.updates[ptr] = copyBuf
+		db.page.umu.Unlock()
 		return ptr
 	}
 	return db.pageAppend(node)
 }
 
 func (db *KV) pageWrite(ptr uint64) []byte {
+	db.page.umu.RLock()
 	if node, ok := db.page.updates[ptr]; ok {
+		db.page.umu.RUnlock()
 		return node
 	}
+	db.page.umu.RUnlock()
 	node := make([]byte, BTREE_PAGE_SIZE)
 	copy(node, db.pageReadFile(ptr))
+	db.page.umu.Lock()
 	db.page.updates[ptr] = node
+	db.page.umu.Unlock()
 	return node
 }
 
 func writePages(db *KV) error {
-	for i := uint64(0); i < db.page.nappend; i++ {
-		ptr := db.page.flushed + i
-		pg := db.page.updates[ptr]
+	db.page.umu.RLock()
+	nappend := db.page.nappend
+	flushed := db.page.flushed
+	upd := make(map[uint64][]byte, len(db.page.updates))
+	for k, v := range db.page.updates {
+		upd[k] = v
+	}
+	db.page.umu.RUnlock()
+
+	for i := uint64(0); i < nappend; i++ {
+		ptr := flushed + i
+		pg := upd[ptr]
 		off := int64(ptr) * int64(BTREE_PAGE_SIZE)
 		n, err := db.file.WriteAt(pg, off)
 		if err != nil {
@@ -140,10 +178,12 @@ func writePages(db *KV) error {
 		if n != BTREE_PAGE_SIZE {
 			return fmt.Errorf("short write")
 		}
+		db.cmu.Lock()
 		db.cache[ptr] = append([]byte(nil), pg...)
+		db.cmu.Unlock()
 	}
-	for ptr, pg := range db.page.updates {
-		if ptr < db.page.flushed {
+	for ptr, pg := range upd {
+		if ptr < flushed {
 			off := int64(ptr) * int64(BTREE_PAGE_SIZE)
 			n, err := db.file.WriteAt(pg, off)
 			if err != nil {
@@ -152,12 +192,17 @@ func writePages(db *KV) error {
 			if n != BTREE_PAGE_SIZE {
 				return fmt.Errorf("short write")
 			}
+			db.cmu.Lock()
 			db.cache[ptr] = append([]byte(nil), pg...)
+			db.cmu.Unlock()
 		}
 	}
-	db.page.flushed += db.page.nappend
+
+	db.page.umu.Lock()
+	db.page.flushed = flushed + nappend
 	db.page.nappend = 0
 	db.page.updates = make(map[uint64][]byte)
+	db.page.umu.Unlock()
 	return nil
 }
 
@@ -189,7 +234,9 @@ func loadMeta(db *KV, data []byte) {
 
 func readRoot(db *KV, fileSize int64) error {
 	if fileSize == 0 {
+		db.page.umu.Lock()
 		db.page.flushed = 2
+		db.page.umu.Unlock()
 		db.free.headPage = 1
 		db.free.tailPage = 1
 		return nil
@@ -245,8 +292,10 @@ func updateOrRevert(db *KV, meta []byte) error {
 	err := updateFile(db)
 	if err != nil {
 		loadMeta(db, meta)
+		db.page.umu.Lock()
 		db.page.updates = make(map[uint64][]byte)
 		db.page.nappend = 0
+		db.page.umu.Unlock()
 		db.failed = true
 	}
 	return err
@@ -259,3 +308,5 @@ func createFileSync(file string) (*os.File, error) {
 	}
 	return f, nil
 }
+
+func (db *KV) FreeTailSeq() uint64 { return db.free.tailSeq }

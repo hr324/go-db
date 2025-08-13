@@ -80,3 +80,13 @@ func (fl *FreeList) PushTail(ptr uint64) {
 		}
 	}
 }
+
+func (fl *FreeList) PopHeadLe(max uint64) uint64 {
+	old := fl.maxSeq
+	if max < old {
+		fl.maxSeq = max
+	}
+	ptr := fl.PopHead()
+	fl.maxSeq = old
+	return ptr
+}

@@ -8,9 +8,10 @@ import (
 var ErrTxClosed = errors.New("tx closed")
 
 type Tx struct {
-	db     *KV
-	meta   []byte
-	closed bool
+	db      *KV
+	meta    []byte
+	closed  bool
+	release func()
 }
 
 func (db *KV) ensureInit() {
@@ -58,7 +59,12 @@ func (tx *Tx) Commit() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	return updateOrRevert(tx.db, tx.meta)
+	err := updateOrRevert(tx.db, tx.meta)
+	if tx.release != nil {
+		tx.release()
+		tx.release = nil
+	}
+	return err
 }
 
 func (tx *Tx) Rollback() {
@@ -66,9 +72,15 @@ func (tx *Tx) Rollback() {
 		return
 	}
 	loadMeta(tx.db, tx.meta)
+	tx.db.page.umu.Lock()
 	tx.db.page.updates = make(map[uint64][]byte)
 	tx.db.page.nappend = 0
+	tx.db.page.umu.Unlock()
 	tx.closed = true
+	if tx.release != nil {
+		tx.release()
+		tx.release = nil
+	}
 }
 
 func (db *KV) Do(fn func(*Tx) error) error {
